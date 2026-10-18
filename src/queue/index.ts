@@ -7,6 +7,11 @@ let startPromise: Promise<PgBoss> | null = null;
 export const BOOKING_CONFIRMATION_QUEUE = 'booking-confirmation';
 export const EVENT_UPDATE_NOTIFICATION_QUEUE = 'event-update-notification';
 
+// Optimization (API pg-boss Pool Isolation):
+// The API web process only enqueues background jobs. It keeps using DATABASE_URL (direct session mode)
+// because pg-boss requires session-level LISTEN/NOTIFY and advisory locks.
+// It is configured with max: 2 connections to leave the remaining database connection slots
+// open for web requests and the dedicated worker process.
 export async function getBoss(): Promise<PgBoss> {
   if (bossInstance) {
     return bossInstance;
@@ -23,6 +28,7 @@ export async function getBoss(): Promise<PgBoss> {
   bossInstance = new PgBoss({
     connectionString: config.databaseUrl,
     ssl: isLocalhost || !config.databaseUrl ? false : { rejectUnauthorized: false },
+    max: 2, // Small pool for API process to avoid connection exhaustion
   });
 
   bossInstance.on('error', (err) => {

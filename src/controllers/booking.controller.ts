@@ -5,10 +5,11 @@ import { enqueueBookingConfirmation } from '../queue';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// OPTIMIZED IMPLEMENTATION:
-// - Atomic conditional UPDATE (WHERE available_tickets >= quantity)
-// - Executes in single round-trip, releasing connection immediately
-// - Zero connection pool starvation, zero overselling, 100% clean 400 responses when sold out
+// Optimization (Atomic CTE Statement for Concurrency):
+// Combines conditional ticket decrement and booking insertion into ONE single atomic database round-trip.
+// PostgreSQL evaluates `available_tickets >= $qty` with an engine-level row lock on the event.
+// If tickets are insufficient, 0 rows are updated and 0 rows are inserted.
+// Eliminates race conditions, lost updates, and overselling without application-level locks or holding pool connections.
 export const createBooking = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { event_id, quantity } = req.body;
@@ -27,17 +28,23 @@ export const createBooking = async (req: Request, res: Response, next: NextFunct
       throw new AppError('quantity must be a positive integer', 400);
     }
 
-    // 1. Atomic decrement: locks and updates ONLY IF enough tickets exist
-    const updateResult = await query(
-      `UPDATE events
-       SET available_tickets = available_tickets - $1, updated_at = NOW()
-       WHERE id = $2 AND available_tickets >= $1
-       RETURNING id, title, price, available_tickets`,
-      [parsedQuantity, event_id]
+    // Atomic CTE: Decrements tickets ONLY IF available, and inserts booking in the same query
+    const bookingResult = await query(
+      `WITH upd AS (
+         UPDATE events
+         SET available_tickets = available_tickets - $1, updated_at = NOW()
+         WHERE id = $2 AND available_tickets >= $1
+         RETURNING id, price
+       )
+       INSERT INTO bookings (user_id, event_id, quantity, total_price)
+       SELECT $3, upd.id, $1, upd.price * $1
+       FROM upd
+       RETURNING *`,
+      [parsedQuantity, event_id, userId]
     );
 
-    // If 0 rows updated: either event doesn't exist or tickets ran out
-    if (updateResult.rows.length === 0) {
+    // If zero rows returned, determine if event does not exist or tickets are sold out
+    if (bookingResult.rows.length === 0) {
       const checkEvent = await query('SELECT id FROM events WHERE id = $1', [event_id]);
       if (checkEvent.rows.length === 0) {
         throw new AppError('Event not found', 404);
@@ -45,20 +52,9 @@ export const createBooking = async (req: Request, res: Response, next: NextFunct
       throw new AppError('Not enough available tickets', 400);
     }
 
-    const event = updateResult.rows[0];
-    const totalPrice = Number(event.price) * parsedQuantity;
-
-    // 2. Insert booking record
-    const bookingResult = await query(
-      `INSERT INTO bookings (user_id, event_id, quantity, total_price, status)
-       VALUES ($1, $2, $3, $4, 'confirmed')
-       RETURNING *`,
-      [userId, event_id, parsedQuantity, totalPrice]
-    );
-
     const booking = bookingResult.rows[0];
 
-    // 3. Fire-and-forget background queue confirmation
+    // Asynchronous fire-and-forget background job for email confirmation
     enqueueBookingConfirmation(booking.id).catch((err) => {
       console.error('[Queue] Error triggering background enqueue:', err);
     });

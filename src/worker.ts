@@ -1,19 +1,41 @@
-import { getBoss, BOOKING_CONFIRMATION_QUEUE, EVENT_UPDATE_NOTIFICATION_QUEUE } from './queue';
+import { PgBoss } from 'pg-boss';
+import { config } from './config';
+import { BOOKING_CONFIRMATION_QUEUE, EVENT_UPDATE_NOTIFICATION_QUEUE } from './queue';
 import { query } from './db';
 import { sendBookingConfirmationEmail, sendEventUpdateEmail } from './services/email.service';
 
+// Worker Process Setup:
+// The background worker runs in a dedicated process and maintains its own PgBoss instance
+// connecting via DATABASE_URL (direct session mode for LISTEN/NOTIFY and job processing),
+// completely independent of the API server's small pg-boss pool.
+let workerBoss: PgBoss | null = null;
+
 async function startWorker() {
   console.log('[Worker] Starting background worker process...');
-  const boss = await getBoss();
+
+  const isLocalhost =
+    config.databaseUrl.includes('localhost') ||
+    config.databaseUrl.includes('127.0.0.1');
+
+  workerBoss = new PgBoss({
+    connectionString: config.databaseUrl,
+    ssl: isLocalhost || !config.databaseUrl ? false : { rejectUnauthorized: false },
+  });
+
+  workerBoss.on('error', (err) => {
+    console.error('[Worker pg-boss] Error:', err);
+  });
+
+  await workerBoss.start();
 
   // createQueue is idempotent — safe to call from both API and worker
-  await boss.createQueue(BOOKING_CONFIRMATION_QUEUE, {
+  await workerBoss.createQueue(BOOKING_CONFIRMATION_QUEUE, {
     retryLimit: 3,
     retryBackoff: true,
   });
   console.log(`[Worker] Queue '${BOOKING_CONFIRMATION_QUEUE}' ready`);
 
-  await boss.createQueue(EVENT_UPDATE_NOTIFICATION_QUEUE, {
+  await workerBoss.createQueue(EVENT_UPDATE_NOTIFICATION_QUEUE, {
     retryLimit: 3,
     retryBackoff: true,
   });
@@ -22,7 +44,7 @@ async function startWorker() {
   // ── Booking Confirmation Handler ──
   console.log(`[Worker] Listening for '${BOOKING_CONFIRMATION_QUEUE}' jobs...`);
 
-  await boss.work(BOOKING_CONFIRMATION_QUEUE, async (jobs) => {
+  await workerBoss.work(BOOKING_CONFIRMATION_QUEUE, async (jobs) => {
     for (const job of jobs) {
       const { bookingId } = job.data as { bookingId: string };
       const attempt = (job.retryCount || 0) + 1;
@@ -78,7 +100,7 @@ async function startWorker() {
   // ── Event Update Notification Handler ──
   console.log(`[Worker] Listening for '${EVENT_UPDATE_NOTIFICATION_QUEUE}' jobs...`);
 
-  await boss.work(EVENT_UPDATE_NOTIFICATION_QUEUE, async (jobs) => {
+  await workerBoss.work(EVENT_UPDATE_NOTIFICATION_QUEUE, async (jobs) => {
     for (const job of jobs) {
       const { eventId, changes } = job.data as {
         eventId: string;
@@ -145,8 +167,9 @@ async function startWorker() {
 const shutdown = async () => {
   console.log('\n[Worker] Shutting down worker process...');
   try {
-    const boss = await getBoss();
-    await boss.stop();
+    if (workerBoss) {
+      await workerBoss.stop();
+    }
   } catch (err) {
     console.error('[Worker] Error stopping boss:', err);
   }

@@ -5,6 +5,8 @@ dotenv.config();
 export const config = {
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 5000,
   databaseUrl: process.env.DATABASE_URL || '',
+  // Supabase transaction pooler (port 6543) for high-throughput HTTP queries
+  databaseUrlPooled: process.env.DATABASE_URL_POOLED || '',
   jwtSecret: process.env.JWT_SECRET || 'default_fallback_secret_key',
   brevoApiKey: process.env.BREVO_API_KEY || '',
   mailFrom: process.env.MAIL_FROM || 'noreply@eventbooking.com',

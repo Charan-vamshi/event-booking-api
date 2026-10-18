@@ -1,15 +1,20 @@
 import { Pool } from 'pg';
 import { config } from '../config';
 
+// Optimization (Connection Pooling):
+// Uses Supabase transaction pooler (port 6543) via DATABASE_URL_POOLED if provided,
+// falling back to DATABASE_URL. Prevents exhausting direct Postgres connection limits
+// under high concurrent request loads. Pool capped at 20 with 5s connection timeout.
+const connectionString = config.databaseUrlPooled || config.databaseUrl;
+
 const isLocalhost =
-  config.databaseUrl.includes('localhost') ||
-  config.databaseUrl.includes('127.0.0.1');
+  connectionString.includes('localhost') ||
+  connectionString.includes('127.0.0.1');
 
 export const pool = new Pool({
-  connectionString: config.databaseUrl,
-  ssl: isLocalhost || !config.databaseUrl ? false : { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 10000,
+  connectionString,
+  ssl: isLocalhost || !connectionString ? false : { rejectUnauthorized: false },
+  max: 20,
   connectionTimeoutMillis: 5000,
 });
 
