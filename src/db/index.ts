@@ -8,6 +8,9 @@ const isLocalhost =
 export const pool = new Pool({
   connectionString: config.databaseUrl,
   ssl: isLocalhost || !config.databaseUrl ? false : { rejectUnauthorized: false },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
 export const query = (text: string, params?: unknown[]) => {
