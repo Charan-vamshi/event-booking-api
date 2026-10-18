@@ -1,15 +1,43 @@
-import nodemailer from 'nodemailer';
 import { config } from '../config';
 
-const transporter = nodemailer.createTransport({
-  host: 'smtp-relay.brevo.com',
-  port: 587,
-  secure: false, // TLS
-  auth: {
-    user: config.brevoSmtpUser,
-    pass: config.brevoSmtpPass,
-  },
-});
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
+const TIMEOUT_MS = 15_000;
+
+async function brevoSend(payload: {
+  to: { email: string; name: string }[];
+  subject: string;
+  htmlContent: string;
+  textContent: string;
+}): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const res = await fetch(BREVO_API_URL, {
+      method: 'POST',
+      headers: {
+        'api-key': config.brevoApiKey,
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({
+        sender: { name: 'Event Booking System', email: config.mailFrom },
+        to: payload.to,
+        subject: payload.subject,
+        htmlContent: payload.htmlContent,
+        textContent: payload.textContent,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Brevo API ${res.status}: ${body}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface BookingEmailData {
   to: string;
@@ -25,11 +53,10 @@ export interface BookingEmailData {
 export async function sendBookingConfirmationEmail(data: BookingEmailData): Promise<void> {
   const formattedDate = new Date(data.eventDate).toLocaleString();
 
-  const mailOptions = {
-    from: config.mailFrom,
-    to: data.to,
+  await brevoSend({
+    to: [{ email: data.to, name: data.customerName }],
     subject: `Booking Confirmed: ${data.eventTitle}`,
-    html: `
+    htmlContent: `
       <h2>Booking Confirmation</h2>
       <p>Hi ${data.customerName},</p>
       <p>Your tickets have been confirmed! Here are the event details:</p>
@@ -43,10 +70,8 @@ export async function sendBookingConfirmationEmail(data: BookingEmailData): Prom
       </ul>
       <p>Thank you for booking with us!</p>
     `,
-    text: `Booking Confirmation\n\nHi ${data.customerName},\n\nYour tickets have been confirmed!\nEvent: ${data.eventTitle}\nDate & Time: ${formattedDate}\nVenue: ${data.venue}\nQuantity: ${data.quantity}\nTotal Price: $${Number(data.totalPrice).toFixed(2)}\nBooking ID: ${data.bookingId}`,
-  };
-
-  await transporter.sendMail(mailOptions);
+    textContent: `Booking Confirmation\n\nHi ${data.customerName},\n\nYour tickets have been confirmed!\nEvent: ${data.eventTitle}\nDate & Time: ${formattedDate}\nVenue: ${data.venue}\nQuantity: ${data.quantity}\nTotal Price: $${Number(data.totalPrice).toFixed(2)}\nBooking ID: ${data.bookingId}`,
+  });
 }
 
 export interface EventUpdateEmailData {
@@ -69,11 +94,10 @@ export async function sendEventUpdateEmail(data: EventUpdateEmailData): Promise<
     .map((c) => `  ${c.field}: ${c.oldValue} → ${c.newValue}`)
     .join('\n');
 
-  const mailOptions = {
-    from: config.mailFrom,
-    to: data.to,
+  await brevoSend({
+    to: [{ email: data.to, name: data.customerName }],
     subject: `Event Updated: ${data.eventTitle}`,
-    html: `
+    htmlContent: `
       <h2>Event Update Notification</h2>
       <p>Hi ${data.customerName},</p>
       <p>An event you have booked has been updated. Here are the current details:</p>
@@ -88,8 +112,6 @@ export async function sendEventUpdateEmail(data: EventUpdateEmailData): Promise<
       </ul>
       <p>If you have any questions, please contact the event organizer.</p>
     `,
-    text: `Event Update Notification\n\nHi ${data.customerName},\n\nAn event you have booked has been updated.\nEvent: ${data.eventTitle}\nDate & Time: ${formattedDate}\nVenue: ${data.venue}\n\nWhat changed:\n${changesText}`,
-  };
-
-  await transporter.sendMail(mailOptions);
+    textContent: `Event Update Notification\n\nHi ${data.customerName},\n\nAn event you have booked has been updated.\nEvent: ${data.eventTitle}\nDate & Time: ${formattedDate}\nVenue: ${data.venue}\n\nWhat changed:\n${changesText}`,
+  });
 }
