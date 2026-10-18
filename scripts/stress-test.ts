@@ -122,11 +122,16 @@ async function run() {
     }
 
     // Verify final tickets in database
-    const verifyRes = await fetch(`${BASE_URL}/events/${eventId}`, {
-      headers: { Authorization: `Bearer ${custToken}` },
-    });
-    const verifyData = await verifyRes.json();
-    const finalAvailable = verifyData.event ? verifyData.event.available_tickets : -1;
+    let finalAvailable = -1;
+    try {
+      const verifyRes = await fetch(`${BASE_URL}/events/${eventId}`, {
+        headers: { Authorization: `Bearer ${custToken}` },
+      });
+      const verifyData = await verifyRes.json();
+      finalAvailable = verifyData.event ? verifyData.event.available_tickets : -1;
+    } catch {
+      // ignore
+    }
 
     console.log(`\nResults for Concurrency = ${concurrency}:`);
     console.log(`- Time taken: ${durationMs}ms`);
