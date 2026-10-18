@@ -3,27 +3,39 @@ dotenv.config();
 
 const BASE_URL = process.env.API_URL || 'https://event-booking-api-fr2b.onrender.com';
 
-interface TestResult {
-  concurrency: number;
-  totalRequests: number;
-  successCount: number;
-  soldOutCount: number;
-  failedCount: number;
-  durationMs: number;
-  oversold: boolean;
-  finalAvailableTickets: number;
+// 1. Concurrency levels with CLI override support (e.g. tsx scripts/stress-test.ts 10,25,50)
+const cliArgs = process.argv.slice(2);
+let concurrencyLevels = [5, 15, 30, 50, 100, 200, 500];
+
+if (cliArgs.length > 0) {
+  const parsed = cliArgs
+    .flatMap((arg) => arg.split(','))
+    .map((val) => parseInt(val.trim(), 10))
+    .filter((num) => !isNaN(num) && num > 0);
+  if (parsed.length > 0) {
+    concurrencyLevels = parsed;
+  }
+}
+
+interface RequestOutcome {
+  status: number;
+  latencyMs: number;
+  timedOut: boolean;
+  error?: string;
 }
 
 async function run() {
-  console.log(`\n==================================================`);
+  console.log(`\n======================================================================`);
   console.log(`  STRESS TEST: EVENT BOOKING API`);
   console.log(`  Target: ${BASE_URL}`);
-  console.log(`==================================================\n`);
+  console.log(`  Concurrency Levels: ${concurrencyLevels.join(', ')}`);
+  console.log(`  Request Timeout: 30 seconds`);
+  console.log(`======================================================================\n`);
 
-  // 1. Register & Login Organizer
+  // Register & Login Organizer
   const orgEmail = `org_${Date.now()}@test.com`;
   const orgPass = 'pass12345';
-  console.log(`[1] Creating organizer: ${orgEmail}...`);
+  console.log(`[Setup] Creating organizer: ${orgEmail}...`);
   await fetch(`${BASE_URL}/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -37,10 +49,10 @@ async function run() {
   });
   const { token: orgToken } = await orgLoginRes.json();
 
-  // 2. Register & Login Customer
+  // Register & Login Customer
   const custEmail = `cust_${Date.now()}@test.com`;
   const custPass = 'pass12345';
-  console.log(`[2] Creating customer: ${custEmail}...`);
+  console.log(`[Setup] Creating customer: ${custEmail}...`);
   await fetch(`${BASE_URL}/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -54,39 +66,50 @@ async function run() {
   });
   const { token: custToken } = await custLoginRes.json();
 
-  // Run tests at increasing concurrency levels
-  const concurrencyLevels = [5, 15, 30, 50];
-  const TOTAL_TICKETS = 20;
-
+  // Run tests for each concurrency level
   for (const concurrency of concurrencyLevels) {
-    console.log(`\n--------------------------------------------------`);
+    // 2. Tickets = half concurrency to ensure high contention
+    const totalTickets = Math.max(1, Math.floor(concurrency / 2));
+
+    console.log(`\n----------------------------------------------------------------------`);
     console.log(`Testing Concurrency Level: ${concurrency} simultaneous users`);
-    console.log(`Target Event Tickets: ${TOTAL_TICKETS}`);
-    console.log(`--------------------------------------------------`);
+    console.log(`Target Event Tickets: ${totalTickets} (Contention ratio: 2 requests per ticket)`);
+    console.log(`----------------------------------------------------------------------`);
 
-    // Create a fresh event with 20 tickets
+    // Create fresh event for this concurrency test
     const eventDate = new Date(Date.now() + 86400000 * 7).toISOString();
-    const createRes = await fetch(`${BASE_URL}/events`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${orgToken}`,
-      },
-      body: JSON.stringify({
-        title: `Stress Event C-${concurrency}`,
-        description: 'Load test event',
-        venue: 'Load Test Arena',
-        event_date: eventDate,
-        price: 10,
-        total_tickets: TOTAL_TICKETS,
-      }),
-    });
-    const { event } = await createRes.json();
-    const eventId = event.id;
+    let eventId = '';
+    try {
+      const createRes = await fetch(`${BASE_URL}/events`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${orgToken}`,
+        },
+        body: JSON.stringify({
+          title: `Load Test C-${concurrency}`,
+          description: `Contention test with ${concurrency} users for ${totalTickets} tickets`,
+          venue: 'Stress Arena',
+          event_date: eventDate,
+          price: 15,
+          total_tickets: totalTickets,
+        }),
+      });
+      const createData = await createRes.json();
+      eventId = createData.event.id;
+    } catch (err: any) {
+      console.error(`Failed to create event for concurrency ${concurrency}:`, err.message);
+      continue;
+    }
 
-    // Fire `concurrency` booking requests simultaneously
-    const startTime = Date.now();
-    const requests = Array.from({ length: concurrency }).map(async () => {
+    // 4. Fire concurrent requests with 30s timeout
+    const testStartTime = performance.now();
+
+    const requestPromises: Promise<RequestOutcome>[] = Array.from({ length: concurrency }).map(async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30_000);
+      const reqStart = performance.now();
+
       try {
         const res = await fetch(`${BASE_URL}/bookings`, {
           method: 'POST',
@@ -98,58 +121,92 @@ async function run() {
             event_id: eventId,
             quantity: 1,
           }),
+          signal: controller.signal,
         });
 
-        const status = res.status;
-        const data = await res.json().catch(() => ({}));
-        return { status, data };
+        const latencyMs = performance.now() - reqStart;
+        return {
+          status: res.status,
+          latencyMs,
+          timedOut: false,
+        };
       } catch (err: any) {
-        return { status: 0, error: err.message };
+        const latencyMs = performance.now() - reqStart;
+        const timedOut = err.name === 'AbortError' || controller.signal.aborted;
+        return {
+          status: 0,
+          latencyMs,
+          timedOut,
+          error: timedOut ? 'Request timed out after 30s' : err.message,
+        };
+      } finally {
+        clearTimeout(timeoutId);
       }
     });
 
-    const results = await Promise.all(requests);
-    const durationMs = Date.now() - startTime;
+    const results = await Promise.all(requestPromises);
+    const totalDurationMs = performance.now() - testStartTime;
+    const totalDurationSec = totalDurationMs / 1000;
 
+    // 3. Calculate metrics: RPS, Latency (avg, p95), Success, Sold-out, Errors
     let successCount = 0;
     let soldOutCount = 0;
-    let failedCount = 0;
+    let errorCount = 0;
+    const latencies: number[] = [];
 
     for (const r of results) {
-      if (r.status === 201) successCount++;
-      else if (r.status === 400) soldOutCount++;
-      else failedCount++; // 500, network error, or dropped
+      latencies.push(r.latencyMs);
+      if (r.status === 201) {
+        successCount++;
+      } else if (r.status === 400) {
+        soldOutCount++;
+      } else {
+        errorCount++; // 500, network error, or 30s timeout
+      }
     }
 
-    // Verify final tickets in database
-    let finalAvailable = -1;
+    latencies.sort((a, b) => a - b);
+    const avgLatency = (latencies.reduce((sum, val) => sum + val, 0) / (latencies.length || 1)).toFixed(1);
+    const p95Index = Math.min(latencies.length - 1, Math.floor(latencies.length * 0.95));
+    const p95Latency = latencies[p95Index] ? latencies[p95Index].toFixed(1) : '0';
+    const rps = (concurrency / (totalDurationSec || 0.001)).toFixed(2);
+
+    // Verify tickets in database
+    let finalTicketsInDb = -1;
     try {
       const verifyRes = await fetch(`${BASE_URL}/events/${eventId}`, {
         headers: { Authorization: `Bearer ${custToken}` },
       });
       const verifyData = await verifyRes.json();
-      finalAvailable = verifyData.event ? verifyData.event.available_tickets : -1;
+      finalTicketsInDb = verifyData.event ? verifyData.event.available_tickets : -1;
     } catch {
       // ignore
     }
 
-    console.log(`\nResults for Concurrency = ${concurrency}:`);
-    console.log(`- Time taken: ${durationMs}ms`);
-    console.log(`- Successful Bookings (201): ${successCount}`);
-    console.log(`- Rejected Gracefully (400 Sold Out): ${soldOutCount}`);
-    console.log(`- Dropped / Server Errors (500 / Crash): ${failedCount}`);
-    console.log(`- Final Available Tickets in DB: ${finalAvailable} (Expected: ${Math.max(0, TOTAL_TICKETS - successCount)})`);
+    const expectedTicketsInDb = Math.max(0, totalTickets - successCount);
 
-    if (failedCount > 0) {
-      console.log(`⚠️ BREAKING POINT HIT: ${failedCount} requests dropped or crashed under ${concurrency} concurrent requests!`);
+    // Print detailed metrics
+    console.log(`Results for Concurrency = ${concurrency}:`);
+    console.log(`- Total time:                  ${totalDurationMs.toFixed(0)} ms (${totalDurationSec.toFixed(2)} s)`);
+    console.log(`- Requests per second (RPS):   ${rps}`);
+    console.log(`- Average latency:             ${avgLatency} ms`);
+    console.log(`- p95 latency:                 ${p95Latency} ms`);
+    console.log(`- Successes (201):             ${successCount}`);
+    console.log(`- Sold-out rejections (400):   ${soldOutCount}`);
+    console.log(`- Errors (500 or timeouts):    ${errorCount}`);
+    console.log(`- Final tickets in DB:         ${finalTicketsInDb} (Expected: ${expectedTicketsInDb})`);
+
+    // Oversold check
+    if (successCount > totalTickets) {
+      console.log(`\n🚨 OVERSOLD WARNING: ${successCount} tickets booked, but only ${totalTickets} were available! (Overbooked by ${successCount - totalTickets})`);
     } else {
-      console.log(`✅ Handled cleanly.`);
+      console.log(`✅ Integrity verified: No overselling occurred (Sold: ${successCount}/${totalTickets}).`);
     }
   }
 
-  console.log(`\n==================================================`);
-  console.log(`  STRESS TEST FINISHED`);
-  console.log(`==================================================\n`);
+  console.log(`\n======================================================================`);
+  console.log(`  STRESS TEST RUN COMPLETE`);
+  console.log(`======================================================================\n`);
 }
 
 run().catch(console.error);
