@@ -47,6 +47,11 @@ async function startWorker() {
 
       const bookingInfo = result.rows[0];
 
+      if (bookingInfo.customer_email.toLowerCase().endsWith('@test.com')) {
+        console.log('[Worker] SKIPPED (test address)');
+        return;
+      }
+
       try {
         await sendBookingConfirmationEmail({
           to: bookingInfo.customer_email,
@@ -109,6 +114,11 @@ async function startWorker() {
 
       // Send one email per customer; one failure must not block others
       for (const customer of customersResult.rows) {
+        if (customer.email.toLowerCase().endsWith('@test.com')) {
+          console.log('[Worker] SKIPPED (test address)');
+          continue;
+        }
+
         try {
           await sendEventUpdateEmail({
             to: customer.email,
